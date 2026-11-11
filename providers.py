@@ -1,6 +1,7 @@
 """Bốn provider cùng một interface. Không chứa agent loop."""
 import json
 import os
+import time
 import urllib.error
 import urllib.request
 
@@ -12,16 +13,39 @@ CONFIG = {
 }
 
 
-def post_json(url, headers, payload):
-    req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={'Content-Type': 'application/json', **headers})
+RETRY_STATUS = {429, 500, 502, 503, 504}
+MAX_RETRIES = int(os.getenv('PROVIDER_MAX_RETRIES', '4'))
+
+
+def _wait_seconds(attempt, exc=None):
+    """Đọc Retry-After nếu có (tối đa 60s); nếu không thì backoff 5, 10, 20, 40s."""
+    retry_after = exc.headers.get('Retry-After') if exc is not None and exc.headers else None
     try:
-        with urllib.request.urlopen(req, timeout=60) as response:
-            return json.load(response)
-    except urllib.error.HTTPError as exc:
-        # Do not print response bodies: they may contain account or request data.
-        raise RuntimeError(f'Provider trả HTTP {exc.code}; kiểm tra model, key và quota.') from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f'Không kết nối được provider: {exc.reason}') from exc
+        return min(float(retry_after), 60.0)
+    except (TypeError, ValueError):
+        return min(5 * 2 ** attempt, 40)
+
+
+def post_json(url, headers, payload):
+    """POST JSON; tự thử lại có giới hạn với lỗi tạm thời (429/5xx/timeout)."""
+    body = json.dumps(payload).encode()
+    for attempt in range(MAX_RETRIES + 1):
+        req = urllib.request.Request(url, data=body, headers={'Content-Type': 'application/json', **headers})
+        try:
+            with urllib.request.urlopen(req, timeout=90) as response:
+                return json.load(response)
+        except urllib.error.HTTPError as exc:
+            if exc.code in RETRY_STATUS and attempt < MAX_RETRIES:
+                time.sleep(_wait_seconds(attempt, exc))
+                continue
+            # Do not print response bodies: they may contain account or request data.
+            raise RuntimeError(f'Provider trả HTTP {exc.code}; kiểm tra model, key và quota.') from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            if attempt < MAX_RETRIES:
+                time.sleep(_wait_seconds(attempt))
+                continue
+            reason = getattr(exc, 'reason', exc)
+            raise RuntimeError(f'Không kết nối được provider: {reason}') from exc
 
 
 class Provider:
